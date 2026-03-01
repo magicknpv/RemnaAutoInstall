@@ -1,32 +1,24 @@
 #!/bin/bash
 # =============================================================================
 # RemnaWave Node Auto-Installer with ZeroTier + Prometheus + Monitoring
-# =============================================================================
-# Этот скрипт выполняет:
-# 1. Установку Docker (если не установлен)
-# 2. Запуск ноды RemnaWave через docker-compose (запрашивает конфиг у пользователя)
-# 3. Установку ZeroTier и подключение к внутренней сети
-# 4. Установку Prometheus и node_exporter на хост с конфигурацией под ZeroTier IP
-# 5. Установку beszel-agent для мониторинга
-# 6. Настройку iptables для закрытия портов 9090/9100 во внешнюю сеть
+# Версия 1.1: Исправлено получение ZeroTier IP
 # =============================================================================
 
-set -e  # Выход при ошибке
+set -e
 
-# Цвета для вывода
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Логирование
 log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# Проверка прав root
+# Проверка root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "Скрипт должен быть запущен от root (sudo)"
@@ -34,7 +26,7 @@ check_root() {
     fi
 }
 
-# Проверка и установка Docker
+# Установка Docker
 install_docker() {
     log_info "Проверка Docker..."
     if ! command -v docker &> /dev/null; then
@@ -48,23 +40,21 @@ install_docker() {
     
     if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
         log_info "Установка docker compose plugin..."
-        apt-get update && apt-get install -y docker-compose-plugin
+        apt-get update && apt-get install -y docker-compose-plugin 2>/dev/null || true
     fi
 }
 
-# Установка RemnaWave node через docker-compose
+# Установка RemnaWave node
 install_remnawave_node() {
     log_info "=== Установка RemnaWave Node ==="
     
-    # Создаём директорию
     NODE_DIR="/opt/remnanode"
     mkdir -p "$NODE_DIR"
     cd "$NODE_DIR"
     
-    # Запрашиваем содержимое docker-compose.yml
     echo ""
     log_info "Вставьте содержимое docker-compose.yml из панели RemnaWave:"
-    log_info "(нажмите Ctrl+D когда закончите ввод, или вставьте и нажмите Enter дважды)"
+    log_info "(нажмите Ctrl+D когда закончите ввод)"
     echo "--- НАЧНИТЕ ВВОД ---"
     
     COMPOSE_CONTENT=$(cat)
@@ -74,14 +64,13 @@ install_remnawave_node() {
         exit 1
     fi
     
-    # Сохраняем docker-compose.yml
     echo "$COMPOSE_CONTENT" > docker-compose.yml
     log_success "docker-compose.yml сохранён в $NODE_DIR"
     
-    # Запрашиваем .env если нужно
+    # Запрос .env если нужен
     if echo "$COMPOSE_CONTENT" | grep -q "env_file:"; then
         echo ""
-        log_info "Вставьте содержимое .env файла (или нажмите Enter для пропуска):"
+        log_info "Вставьте содержимое .env файла (или Enter для пропуска):"
         ENV_CONTENT=$(cat)
         if [[ -n "$ENV_CONTENT" ]]; then
             echo "$ENV_CONTENT" > .env
@@ -89,7 +78,6 @@ install_remnawave_node() {
         fi
     fi
     
-    # Запускаем контейнеры
     log_info "Запускаю контейнеры RemnaWave..."
     if docker compose version &> /dev/null; then
         docker compose up -d
@@ -98,21 +86,41 @@ install_remnawave_node() {
     fi
     
     sleep 5
-    
-    # Проверка статуса
-    if docker ps | grep -q remnanode; then
-        log_success "RemnaWave node запущена успешно"
-        docker compose logs -f -t &
+    if docker ps --format '{{.Names}}' | grep -qi remna; then
+        log_success "RemnaWave node запущена"
     else
-        log_warn "Контейнер может запускаться... проверьте логи: cd $NODE_DIR && docker compose logs -f"
+        log_warn "Проверьте логи: cd $NODE_DIR && docker compose logs -f"
     fi
 }
 
-# Установка ZeroTier и получение внутреннего IP
+# 🔧 ИСПРАВЛЕННАЯ ФУНКЦИЯ: Получение ZeroTier IP
+get_zerotier_ip() {
+    local ip=""
+    
+    # Способ 1: Парсинг человекочитаемого вывода (самый надёжный)
+    # Формат: 200 listnetworks <nwid> <name> <mac> <status> <type> <dev> <ZT assigned ips>
+    ip=$(zerotier-cli listnetworks 2>/dev/null | grep -v "^200 listnetworks <nwid>" | awk '{print $NF}' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    
+    # Способ 2: JSON парсинг через grep (если первый не сработал)
+    if [[ -z "$ip" ]]; then
+        ip=$(zerotier-cli listnetworks -j 2>/dev/null | grep -oE '"assignedAddresses":\["[^"]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    fi
+    
+    # Способ 3: Через jq если установлен
+    if [[ -z "$ip" ]] && command -v jq &> /dev/null; then
+        ip=$(zerotier-cli listnetworks -j 2>/dev/null | jq -r '.[]?.assignedAddresses?[0] // empty' 2>/dev/null | cut -d'/' -f1 | head -1)
+    fi
+    
+    # Убираем маску подсети если осталась
+    ip="${ip%%/*}"
+    
+    echo "$ip"
+}
+
+# Установка ZeroTier
 setup_zerotier() {
     log_info "=== Настройка ZeroTier ==="
     
-    # Установка ZeroTier
     if ! command -v zerotier-cli &> /dev/null; then
         log_info "Устанавливаю ZeroTier..."
         curl -s https://install.zerotier.com | sudo bash
@@ -122,7 +130,6 @@ setup_zerotier() {
         log_success "ZeroTier уже установлен"
     fi
     
-    # Запрос ID сети
     echo ""
     read -p "Введите ZeroTier Network ID: " ZT_NETWORK_ID
     
@@ -131,44 +138,52 @@ setup_zerotier() {
         exit 1
     fi
     
-    # Подключение к сети
-    log_info "Подключаюсь к сети ZeroTier: $ZT_NETWORK_ID"
+    log_info "Подключаюсь к сети: $ZT_NETWORK_ID"
     zerotier-cli join "$ZT_NETWORK_ID"
     
-    # Ожидание авторизации и получения IP
-    log_info "Ожидаю авторизации в сети ZeroTier (макс. 60 сек)..."
+    # Ожидание IP с улучшенным выводом для отладки
+    log_info "Ожидаю получения IP (макс. 90 сек)..."
     ZT_IP=""
-    for i in {1..12}; do
+    for i in {1..18}; do
         sleep 5
-        ZT_IP=$(zerotier-cli listnetworks -j 2>/dev/null | grep -oP '"assignedAddresses":\["\K[0-9./]+' | head -1)
+        
+        # Показываем текущий статус для наглядности
+        local status=$(zerotier-cli listnetworks 2>/dev/null | grep -v "^200 listnetworks <nwid>" | head -1)
+        log_info "Попытка $i/18: $status"
+        
+        ZT_IP=$(get_zerotier_ip)
+        
         if [[ -n "$ZT_IP" ]]; then
-            # Убираем маску подсети если есть
-            ZT_IP="${ZT_IP%%/*}"
-            log_success "Получен ZeroTier IP: $ZT_IP"
+            log_success "✓ Получен ZeroTier IP: $ZT_IP"
             break
         fi
-        log_info "Попытка $i/12: ожидаю IP..."
     done
     
     if [[ -z "$ZT_IP" ]]; then
-        log_error "Не удалось получить IP адрес ZeroTier"
-        log_warn "Проверьте в панели ZeroTier, что нода авторизована"
-        log_warn "После авторизации перезапустите скрипт или выполните: zerotier-cli listnetworks"
+        log_error "✗ Не удалось получить IP адрес"
+        echo ""
+        log_warn "Текущий статус ZeroTier:"
+        zerotier-cli listnetworks
+        echo ""
+        log_warn "Действия:"
+        echo "  1. Авторизуйте ноду в панели https://my.zerotier.com"
+        echo "  2. Перезапустите скрипт, или"
+        echo "  3. Выполните вручную: zerotier-cli leave $ZT_NETWORK_ID && zerotier-cli join $ZT_NETWORK_ID"
         exit 1
     fi
     
-    # Сохраняем IP для дальнейшего использования
+    # Сохраняем IP
     echo "$ZT_IP" > /tmp/zt_ip.txt
     export ZT_IP
 }
 
-# Установка Prometheus и node_exporter на хост
+# Установка Prometheus + node_exporter
 install_prometheus_monitoring() {
     log_info "=== Установка Prometheus и Node Exporter ==="
     
     ZT_IP=$(cat /tmp/zt_ip.txt)
     
-    # Установка node_exporter
+    # node_exporter
     if ! command -v node_exporter &> /dev/null; then
         log_info "Устанавливаю node_exporter..."
         NODE_EXPORTER_VERSION="1.7.0"
@@ -183,7 +198,7 @@ install_prometheus_monitoring() {
         log_success "node_exporter уже установлен"
     fi
     
-    # Создание systemd сервиса для node_exporter
+    # Сервис node_exporter
     if [[ ! -f /etc/systemd/system/node_exporter.service ]]; then
         cat > /etc/systemd/system/node_exporter.service << EOF
 [Unit]
@@ -200,10 +215,10 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable --now node_exporter
-        log_success "node_exporter запущен как сервис"
+        log_success "node_exporter запущен"
     fi
     
-    # Установка Prometheus
+    # Prometheus
     if ! command -v prometheus &> /dev/null; then
         log_info "Устанавливаю Prometheus..."
         PROMETHEUS_VERSION="2.48.0"
@@ -213,16 +228,16 @@ EOF
         mv prometheus-${PROMETHEUS_VERSION}.linux-amd64/prometheus /usr/local/bin/
         mv prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool /usr/local/bin/
         mkdir -p /etc/prometheus /var/lib/prometheus
-        cp -r prometheus-${PROMETHEUS_VERSION}.linux-amd64/consoles /etc/prometheus/
-        cp -r prometheus-${PROMETHEUS_VERSION}.linux-amd64/console_libraries /etc/prometheus/
+        cp -r prometheus-${PROMETHEUS_VERSION}.linux-amd64/consoles /etc/prometheus/ 2>/dev/null || true
+        cp -r prometheus-${PROMETHEUS_VERSION}.linux-amd64/console_libraries /etc/prometheus/ 2>/dev/null || true
         rm -rf prometheus-*
         log_success "Prometheus установлен"
     else
         log_success "Prometheus уже установлен"
     fi
     
-    # Конфигурация Prometheus
-    log_info "Настраиваю prometheus.yml для ZeroTier IP: $ZT_IP"
+    # Конфиг Prometheus
+    log_info "Создаю prometheus.yml для IP: $ZT_IP"
     cat > /etc/prometheus/prometheus.yml << EOF
 global:
   scrape_interval: 15s
@@ -242,11 +257,11 @@ scrape_configs:
       - targets: ['${ZT_IP}:9100']
 EOF
     
-    # Создание systemd сервиса для Prometheus
+    # Сервис Prometheus
     if [[ ! -f /etc/systemd/system/prometheus.service ]]; then
         cat > /etc/systemd/system/prometheus.service << EOF
 [Unit]
-Description=Prometheus Monitoring System
+Description=Prometheus Monitoring
 After=network.target
 
 [Service]
@@ -263,13 +278,13 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable --now prometheus
-        log_success "Prometheus запущен как сервис"
+        log_success "Prometheus запущен"
     fi
     
-    log_success "Prometheus доступен на http://${ZT_IP}:9090"
+    log_success "Prometheus UI: http://${ZT_IP}:9090"
 }
 
-# Установка beszel-agent через docker-compose
+# Установка beszel-agent
 install_beszel_agent() {
     log_info "=== Установка Beszel Agent ==="
     
@@ -277,7 +292,6 @@ install_beszel_agent() {
     mkdir -p "$AGENT_DIR"
     cd "$AGENT_DIR"
     
-    # Создаём docker-compose.yml для beszel-agent
     cat > docker-compose.yml << 'EOF'
 services:
   beszel-agent:
@@ -303,110 +317,92 @@ EOF
     fi
     
     sleep 3
-    
-    if docker ps | grep -q beszel-agent; then
-        log_success "Beszel agent запущен успешно"
+    if docker ps --format '{{.Names}}' | grep -q beszel-agent; then
+        log_success "Beszel agent запущен"
     else
-        log_warn "Проверьте статус: docker compose logs -f"
+        log_warn "Проверьте: docker logs beszel-agent"
     fi
 }
 
-# Настройка iptables для защиты портов
+# Настройка iptables
 configure_firewall() {
     log_info "=== Настройка iptables ==="
     
-    # Получаем ZeroTier IP и определяем подсеть (предполагаем стандартную /16)
-    ZT_IP=$(cat /tmp/zt_ip.txt)
-    ZT_SUBNET="172.23.0.0/16"  # Измените если ваша сеть ZeroTier использует другую подсеть
+    ZT_SUBNET="172.23.0.0/16"  # ⚠️ Измените если ваша сеть ZeroTier использует другую подсеть
     
-    log_info "Разрешаю доступ к портам 9090/9100 только из подсети ZeroTier: $ZT_SUBNET"
+    log_info "Разрешаю порты 9090/9100 только из подсети: $ZT_SUBNET"
     
-    # Правила для Prometheus (9090)
+    # Prometheus 9090
     iptables -A INPUT -p tcp -s "$ZT_SUBNET" --dport 9090 -j ACCEPT 2>/dev/null || true
     iptables -A INPUT -p tcp --dport 9090 -j DROP 2>/dev/null || true
     
-    # Правила для Node Exporter (9100)
+    # Node Exporter 9100
     iptables -A INPUT -p tcp -s "$ZT_SUBNET" --dport 9100 -j ACCEPT 2>/dev/null || true
     iptables -A INPUT -p tcp --dport 9100 -j DROP 2>/dev/null || true
     
     log_success "Правила iptables применены"
     
     # Сохранение правил
-    if command -v netfilter-persistent &> /dev/null; then
-        netfilter-persistent save
-    elif command -v iptables-save &> /dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4
-        log_success "Правила сохранены в /etc/iptables/rules.v4"
-    fi
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    log_success "Правила сохранены в /etc/iptables/rules.v4"
     
-    # Установка iptables-persistent для автозагрузки
+    # Установка iptables-persistent
     if ! dpkg -l | grep -q iptables-persistent; then
-        log_info "Устанавливаю iptables-persistent для сохранения правил..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+        log_info "Устанавливаю iptables-persistent..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent 2>/dev/null || true
     fi
     
-    log_info "Текущие правила для портов 9090/9100:"
-    iptables -L INPUT -n --line-numbers | grep -E "9090|9100" || echo "Правила не найдены в выводе"
+    log_info "Активные правила для 9090/9100:"
+    iptables -L INPUT -n --line-numbers | grep -E "9090|9100" || echo "  (нет правил в выводе)"
 }
 
-# Основная функция
+# Главная функция
 main() {
     echo -e "${GREEN}╔════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║${NC}  RemnaWave Node Auto-Installer with Monitoring ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  RemnaWave Node Installer v1.1 (Fixed ZT IP)  ${GREEN}║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
     echo ""
     
     check_root
     
-    echo "Этапы установки:"
-    echo "  1. Проверка/установка Docker"
-    echo "  2. Установка RemnaWave node (docker-compose)"
-    echo "  3. Настройка ZeroTier"
-    echo "  4. Установка Prometheus + node_exporter"
-    echo "  5. Установка Beszel monitoring agent"
-    echo "  6. Настройка iptables"
+    echo "Этапы:"
+    echo "  1. Docker проверка/установка"
+    echo "  2. RemnaWave node (docker-compose)"
+    echo "  3. ZeroTier подключение"
+    echo "  4. Prometheus + node_exporter"
+    echo "  5. Beszel monitoring agent"
+    echo "  6. iptables firewall"
     echo ""
     
-    read -p "Продолжить установку? [y/N]: " -n 1 -r
+    read -p "Продолжить? [y/N]: " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        log_info "Установка отменена"
+        log_info "Отменено"
         exit 0
     fi
     echo ""
     
     install_docker
-    echo ""
-    
     install_remnawave_node
-    echo ""
-    
     setup_zerotier
-    echo ""
-    
     install_prometheus_monitoring
-    echo ""
-    
     install_beszel_agent
-    echo ""
-    
     configure_firewall
-    echo ""
     
+    echo ""
     echo -e "${GREEN}════════════════════════════════════════${NC}"
-    echo -e "${GREEN}✓ Установка завершена успешно!${NC}"
+    echo -e "${GREEN}✓ Установка завершена!${NC}"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo ""
     echo "Полезные команды:"
-    echo "  • Логи RemnaWave:   cd /opt/remnanode && docker compose logs -f"
-    echo "  • Статус ZeroTier:  zerotier-cli listnetworks"
-    echo "  • Prometheus UI:    http://$(cat /tmp/zt_ip.txt):9090"
-    echo "  • Статус сервисов:  systemctl status prometheus node_exporter"
-    echo "  • Beszel agent:     docker logs beszel-agent"
+    echo "  • RemnaWave логи:   cd /opt/remnanode && docker compose logs -f"
+    echo "  • ZeroTier статус:  zerotier-cli listnetworks"
+    echo "  • Prometheus:       http://$(cat /tmp/zt_ip.txt 2>/dev/null || echo 'ZT_IP'):9090"
+    echo "  • Сервисы:          systemctl status prometheus node_exporter"
+    echo "  • Beszel:           docker logs beszel-agent"
     echo ""
     log_info "Не забудьте авторизовать ноду в панели ZeroTier!"
 }
 
-# Запуск
 main "$@"
