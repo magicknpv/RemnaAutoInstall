@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # RemnaWave Node Auto-Installer with ZeroTier + Prometheus + Monitoring
-# Версия 2.1 — Добавлен этап SSH Hardening + Auto-restart на новый ключ
+# Версия 2.2 — SSH Safe Key Wait (ждёт добавления ключа перед рестартом)
 # =============================================================================
 
 set -e
@@ -34,10 +34,7 @@ log_error()   { echo -e "${RED}[✗]${NC} $1"; }
 log_skip()    { echo -e "${CYAN}[→]${NC} $1 (уже установлено, пропускаю)"; }
 
 # Инициализация директории состояния
-init_state() {
-    mkdir -p "$STATE_DIR"
-}
-
+init_state() { mkdir -p "$STATE_DIR"; }
 is_installed() { [[ -f "$STATE_DIR/$1" ]]; }
 mark_installed() { touch "$STATE_DIR/$1"; }
 
@@ -281,7 +278,7 @@ EOF
 }
 
 # =============================================================================
-# 6. SSH HARDENING + KEY WATCHER ✨ НОВЫЙ ЭТАП ✨
+# 6. SSH HARDENING + SAFE KEY WAIT ✨ ИСПРАВЛЕННЫЙ ЭТАП ✨
 # =============================================================================
 configure_ssh() {
     if is_installed "ssh_hardening"; then
@@ -289,9 +286,13 @@ configure_ssh() {
         return 0
     fi
     
-    log_info "=== Настройка SSH (Hardening + Key Watcher) ==="
+    log_info "=== Настройка SSH (Hardening + Safe Key Wait) ==="
+    echo ""
+    log_warn "⚠️  ВНИМАНИЕ: Сейчас будет отключён парольный доступ к SSH!"
+    log_warn "⚠️  Не закрывайте это окно пока не добавите свой SSH ключ!"
+    echo ""
     
-    # 1. Бэкап оригинального конфига (только если ещё не сделано)
+    # 1. Бэкап оригинального конфига
     if [[ ! -f "$SSH_CONFIG_BACKUP" ]]; then
         log_info "Создаю бэкап оригинального sshd_config..."
         cp "$SSH_CONFIG_FILE" "$SSH_CONFIG_BACKUP"
@@ -300,8 +301,28 @@ configure_ssh() {
         log_info "Бэкап уже существует: $SSH_CONFIG_BACKUP"
     fi
     
-    # 2. Применяем жёсткую конфигурацию
-    log_info "Применяю безопасные настройки SSH..."
+    # 2. Создаём директорию .ssh и файл authorized_keys
+    log_info "Готовлю директорию для SSH ключей..."
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch "$SSH_KEY_WATCH_PATH"
+    chmod 600 "$SSH_KEY_WATCH_PATH"
+    log_success "Файл создан: $SSH_KEY_WATCH_PATH"
+    
+    # 3. Показываем текущие ключи (если есть)
+    echo ""
+    log_info "Текущие ключи в authorized_keys:"
+    if [[ -s "$SSH_KEY_WATCH_PATH" ]]; then
+        wc -l < "$SSH_KEY_WATCH_PATH" | xargs -I {} echo "  📌 Найдено ключей: {}"
+        cat "$SSH_KEY_WATCH_PATH" | head -3 | sed 's/^/    /'
+        [[ $(wc -l < "$SSH_KEY_WATCH_PATH") -gt 3 ]] && echo "    ... и ещё $(( $(wc -l < "$SSH_KEY_WATCH_PATH") - 3 ))"
+    else
+        echo "  ⚠️  Файл пустой! Нужно добавить ключ!"
+    fi
+    echo ""
+    
+    # 4. Применяем конфигурацию БЕЗ перезапуска SSH
+    log_info "Применяю безопасные настройки SSH (без перезапуска)..."
     cat > "$SSH_CONFIG_FILE" << 'EOF'
 # RemnaWave SSH Hardening Config
 # Managed by install-remnawave.sh - do not edit manually
@@ -327,10 +348,10 @@ KbdInteractiveAuthentication no
 EOF
     log_success "Конфигурация sshd_config применена"
     
-    # 3. Валидация конфига
+    # 5. Валидация конфига
     log_info "Валидирую конфигурацию SSH..."
     if sshd -t 2>&1; then
-        log_success "Конфигурация SSH валидна"
+        log_success "Конфигурация SSH валидна ✓"
     else
         log_error "❌ Ошибка валидации sshd_config!"
         log_warn "Восстанавливаю бэкап..."
@@ -338,19 +359,114 @@ EOF
         exit 1
     fi
     
-    # 4. Перезапуск SSH (без разрыва текущей сессии)
+    # 6. 🔑 ЖДЁМ ДОБАВЛЕНИЯ КЛЮЧА (интерактивный этап)
+    echo ""
+    echo -e "${MAGENTA}╔════════════════════════════════════════════════════╗${NC}"
+    echo -e "${MAGENTA}║${NC}  🔐 ДОБАВЬТЕ SSH КЛЮЧ ПЕРЕД ПЕРЕЗАПУСКОМ SSH  ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA}╚════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    log_info "Откройте НОВОЕ окно терминала и выполните:"
+    echo ""
+    echo "  # Вариант 1: Через ssh-copy-id (с вашей локальной машины):"
+    echo "  ssh-copy-id -i ~/.ssh/id_ed25519.pub root@$(cat "$ZT_IP_FILE" 2>/dev/null || echo '<SERVER_IP>')"
+    echo ""
+    echo "  # Вариант 2: Вручную скопировать ключ:"
+    echo "  cat ~/.ssh/id_ed25519.pub | ssh root@$(cat "$ZT_IP_FILE" 2>/dev/null || echo '<SERVER_IP>') 'cat >> /root/.ssh/authorized_keys'"
+    echo ""
+    echo "  # Вариант 3: Если вы уже в сессии — откройте второе окно и добавьте:"
+    echo "  nano /root/.ssh/authorized_keys"
+    echo "  # (вставьте публичный ключ, сохраните Ctrl+O, выйдите Ctrl+X)"
+    echo ""
+    log_info "После добавления ключа вернитесь в это окно и подтвердите."
+    echo ""
+    
+    # Проверяем, есть ли уже ключи
+    INITIAL_KEY_COUNT=$(wc -l < "$SSH_KEY_WATCH_PATH" 2>/dev/null || echo "0")
+    
+    if [[ "$INITIAL_KEY_COUNT" -eq 0 ]]; then
+        log_warn "⚠️  Файл authorized_keys пустой!"
+        log_warn "⚠️  ДОБАВЬТЕ КЛЮЧ сейчас, иначе потеряете доступ после перезапуска SSH!"
+        echo ""
+    fi
+    
+    # Цикл ожидания подтверждения
+    while true; do
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        read -p "Вы добавили SSH ключ и можете войти по ключу? [y/N]: " -n 1 -r
+        echo
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            # Проверяем, что ключи действительно есть
+            CURRENT_KEY_COUNT=$(wc -l < "$SSH_KEY_WATCH_PATH" 2>/dev/null || echo "0")
+            
+            if [[ "$CURRENT_KEY_COUNT" -eq 0 ]]; then
+                log_error "❌ Файл authorized_keys всё ещё пустой!"
+                log_error "❌ Не перезапускаю SSH — вы потеряете доступ!"
+                echo ""
+                log_warn "Добавьте ключ и повторите подтверждение."
+                echo ""
+                continue
+            fi
+            
+            if [[ "$CURRENT_KEY_COUNT" -gt "$INITIAL_KEY_COUNT" ]]; then
+                log_success "✓ Обнаружен новый ключ в authorized_keys"
+            else
+                log_warn "! Количество ключей не изменилось (но продолжаю по вашему подтверждению)"
+            fi
+            
+            # Финальное предупреждение
+            echo ""
+            log_warn "⚠️  ФИНАЛЬНОЕ ПОДТВЕРЖДЕНИЕ:"
+            read -p "Вы уверены, что можете войти по SSH ключу? После рестарта пароль не сработает! [y/N]: " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                break
+            else
+                log_info "Отменено пользователем. SSH не перезапущен."
+                log_warn "Конфигурация применена, но SSH работает со старыми настройками."
+                log_warn "Запустите скрипт снова когда будете готовы."
+                return 0
+            fi
+        else
+            log_info "Отменено. Конфигурация применена, но SSH не перезапущен."
+            log_warn "Вы можете добавить ключ позже и перезапустить SSH вручную:"
+            echo "  systemctl restart ssh"
+            echo ""
+            log_info "Хотите выйти или подождать?"
+            read -p "Продолжить ожидание? [y/N]: " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                return 0
+            fi
+        fi
+    done
+    
+    # 7. Перезапуск SSH (только после подтверждения!)
+    echo ""
     log_info "Перезапускаю SSH сервис..."
     if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
-        log_success "SSH сервис перезапущен"
+        log_success "✓ SSH сервис перезапущен"
     else
         log_warn "Не удалось перезапустить SSH через systemctl, пробую reload..."
         systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
     fi
     
-    # 5. 🔑 Настройка авто-рестарта SSH при добавлении нового ключа
-    log_info "Настраиваю watcher для authorized_keys..."
+    # 8. Проверяем, что SSH работает
+    sleep 2
+    if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+        log_success "✓ SSH работает корректно"
+    else
+        log_error "❌ SSH не запустился!"
+        log_warn "Восстанавливаю бэкап конфигурации..."
+        cp "$SSH_CONFIG_BACKUP" "$SSH_CONFIG_FILE"
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        exit 1
+    fi
     
-    # Создаём systemd service для рестарта SSH
+    # 9. 🔑 Настраиваем watcher для будущих ключей
+    log_info "Настраиваю watcher для автоматического рестарта при добавлении ключей..."
+    
     cat > /etc/systemd/system/ssh-key-watcher.service << 'EOF'
 [Unit]
 Description=Restart SSH on authorized_keys change
@@ -359,7 +475,6 @@ After=sshd.service
 [Service]
 Type=oneshot
 ExecStart=/bin/systemctl restart ssh
-# Fallback для систем где сервис называется sshd
 ExecStartPre=/bin/bash -c 'systemctl restart sshd 2>/dev/null || true'
 RemainAfterExit=yes
 
@@ -367,7 +482,6 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
     
-    # Создаём systemd path unit для отслеживания изменений
     cat > /etc/systemd/system/ssh-key-watcher.path << EOF
 [Unit]
 Description=Watch for changes in authorized_keys
@@ -380,36 +494,31 @@ Unit=ssh-key-watcher.service
 WantedBy=multi-user.target
 EOF
     
-    # Активируем watcher
     systemctl daemon-reload
     systemctl enable --now ssh-key-watcher.path 2>/dev/null || log_warn "Не удалось активировать ssh-key-watcher.path"
     
-    # Создаём директорию .ssh если нет
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    touch "$SSH_KEY_WATCH_PATH" 2>/dev/null || true
-    chmod 600 "$SSH_KEY_WATCH_PATH" 2>/dev/null || true
-    
     log_success "Watcher настроен: SSH будет перезапущен при изменении $SSH_KEY_WATCH_PATH"
     
-    # 6. Маркируем как установленное
+    # 10. Маркируем как установленное
     mark_installed "ssh_hardening"
-    log_success "SSH hardening завершён ✅"
     
-    # 7. Информация для пользователя
     echo ""
-    log_info "📋 Как добавить новый SSH ключ:"
-    echo "  1. Скопируйте публичный ключ (~/.ssh/id_ed25519.pub) на сервер:"
-    echo "     ssh-copy-id -i ~/.ssh/id_ed25519.pub root@<ZT_IP>"
-    echo "  2. Или вручную добавьте в /root/.ssh/authorized_keys"
-    echo "  3. SSH автоматически перезагрузится и примет новый ключ"
+    echo -e "${GREEN}══════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  ✓ SSH Hardening завершён успешно!${NC}"
+    echo -e "${GREEN}══════════════════════════════════════════════════════${NC}"
     echo ""
-    log_info "🔐 Текущие настройки SSH:"
+    log_info "📋 Текущие настройки SSH:"
     echo "  • Порт: 22"
-    echo "  • Root login: только по ключу (да)"
-    echo "  • Password auth: отключён"
+    echo "  • Root login: только по ключу ✓"
+    echo "  • Password auth: отключён ✓"
     echo "  • Поддерживаемые ключи: ed25519, ecdsa"
     echo "  • MaxAuthTries: 3"
+    echo "  • Ключей в authorized_keys: $(wc -l < "$SSH_KEY_WATCH_PATH")"
+    echo ""
+    log_info "🔐 Для добавления новых ключей в будущем:"
+    echo "  1. Добавьте ключ в /root/.ssh/authorized_keys"
+    echo "  2. SSH перезагрузится автоматически (watcher)"
+    echo "  3. Или вручную: systemctl restart ssh"
 }
 
 # =============================================================================
@@ -419,10 +528,8 @@ configure_firewall() {
     if is_installed "iptables_rules"; then log_skip "Правила iptables"; return 0; fi
     log_info "=== Настройка iptables ==="
     log_info "Разрешаю порты 9090/9100 только из подсети: $ZT_SUBNET"
-    # Prometheus 9090
     iptables -C INPUT -p tcp -s "$ZT_SUBNET" --dport 9090 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp -s "$ZT_SUBNET" --dport 9090 -j ACCEPT
     iptables -C INPUT -p tcp --dport 9090 -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport 9090 -j DROP
-    # Node Exporter 9100
     iptables -C INPUT -p tcp -s "$ZT_SUBNET" --dport 9100 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp -s "$ZT_SUBNET" --dport 9100 -j ACCEPT
     iptables -C INPUT -p tcp --dport 9100 -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport 9100 -j DROP
     log_success "Правила iptables применены"
@@ -451,6 +558,7 @@ show_status() {
     printf "%-25s %s\n" "iptables rules:" "$(is_installed "iptables_rules" && echo -e "${GREEN}✓${NC}" || echo -e "${YELLOW}○${NC}")"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     [[ -f "$ZT_IP_FILE" ]] && echo -e "🌐 ZeroTier IP: ${GREEN}$(cat "$ZT_IP_FILE")${NC}"
+    [[ -f "$SSH_KEY_WATCH_PATH" ]] && echo -e "🔐 SSH ключей: ${GREEN}$(wc -l < "$SSH_KEY_WATCH_PATH" 2>/dev/null || echo 0)${NC}"
     echo ""
 }
 
@@ -468,7 +576,7 @@ reset_installation() {
 # =============================================================================
 main() {
     echo -e "${GREEN}╔════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║${NC}  RemnaWave Node Installer v2.1 (SSH + Watcher)${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  RemnaWave Node Installer v2.2 (Safe SSH)     ${GREEN}║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
     echo ""
     
@@ -496,7 +604,7 @@ main() {
     echo "  3. ZeroTier"
     echo "  4. Prometheus + node_exporter"
     echo "  5. Beszel monitoring agent"
-    echo "  6. 🔐 SSH Hardening + Key Watcher ← НОВЫЙ"
+    echo "  6. 🔐 SSH Hardening (Safe Key Wait) ← ИСПРАВЛЕН"
     echo "  7. iptables firewall"
     echo ""
     
@@ -509,7 +617,7 @@ main() {
     setup_zerotier; echo ""
     install_prometheus_monitoring; echo ""
     install_beszel_agent; echo ""
-    configure_ssh; echo ""  # ← Новый этап
+    configure_ssh; echo ""
     configure_firewall; echo ""
     
     show_status
@@ -522,6 +630,7 @@ main() {
     echo "  • SSH тест:         ssh -v root@$(cat "$ZT_IP_FILE" 2>/dev/null || echo 'ZT_IP')"
     echo "  • SSH статус:       systemctl status ssh"
     echo "  • Watcher статус:   systemctl status ssh-key-watcher.path"
+    echo "  • Добавить ключ:    nano /root/.ssh/authorized_keys"
     echo "  • RemnaWave логи:   cd /opt/remnanode && docker compose logs -f"
     echo "  • ZeroTier:         zerotier-cli listnetworks"
     echo "  • Prometheus:       http://$(cat "$ZT_IP_FILE" 2>/dev/null):9090"
