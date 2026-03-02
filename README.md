@@ -1,2 +1,4 @@
+```bash
 chmod +x install-remnawave.sh
-sudo ./install-remnawave.s
+sudo ./install-remnawave.sh
+```
