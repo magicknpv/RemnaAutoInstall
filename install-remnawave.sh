@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # RemnaWave Node Auto-Installer with ZeroTier + Prometheus + Monitoring
-# Версия 2.2 — SSH Safe Key Wait (ждёт добавления ключа перед рестартом)
+# Версия 2.3 — Fix: обработка broken apt repos при установке Docker
 # =============================================================================
 
 set -e
@@ -46,23 +46,92 @@ check_root() {
 }
 
 # =============================================================================
+# 🛠️ УТИЛИТА: Исправление broken apt репозиториев
+# =============================================================================
+fix_broken_repos() {
+    log_info "Проверяю apt репозитории на ошибки..."
+    
+    # Пробуем apt-get update, ловим ошибки
+    if ! apt-get update -qq 2>&1 | tee /tmp/apt_update.log | grep -q "Release\|NO_PUBKEY\|404"; then
+        log_success "Все репозитории в порядке"
+        return 0
+    fi
+    
+    log_warn "Обнаружены проблемы с репозиториями, пытаюсь исправить..."
+    
+    # Список известных проблемных репозиториев для Ubuntu Noble
+    local PROBLEM_REPOS=(
+        "ookla/speedtest-cli"
+        "docker-ce"
+        "zerotier"
+    )
+    
+    for repo in "${PROBLEM_REPOS[@]}"; do
+        for file in /etc/apt/sources.list.d/*"${repo}"*.list /etc/apt/sources.list.d/*"${repo}"*.sources 2>/dev/null; do
+            if [[ -f "$file" ]]; then
+                log_warn "Временно отключаю проблемный репозиторий: $(basename "$file")"
+                mv "$file" "${file}.disabled" 2>/dev/null || true
+            fi
+        done
+    done
+    
+    # Пробуем ещё раз update
+    if apt-get update -qq 2>/dev/null; then
+        log_success "Проблемы с репозиториями устранены"
+        return 0
+    else
+        log_warn "Не все репозитории удалось исправить, продолжаю с --allow-releaseinfo-change"
+        apt-get update -qq --allow-releaseinfo-change 2>/dev/null || true
+        return 0  # Не прерываем установку из-за repos
+    fi
+}
+
+# =============================================================================
 # 1. DOCKER
 # =============================================================================
 install_docker() {
     if is_installed "docker"; then log_skip "Docker"; return 0; fi
+    
     log_info "Проверка Docker..."
     if ! command -v docker &> /dev/null; then
         log_info "Docker не найден, устанавливаю..."
-        curl -fsSL https://get.docker.com | sh
-        systemctl enable --now docker
-        log_success "Docker установлен"
+        
+        # 🔧 Исправляем broken repos перед установкой
+        fix_broken_repos
+        
+        # Устанавливаем Docker с обработкой ошибок
+        if curl -fsSL https://get.docker.com -o /tmp/install-docker.sh 2>/dev/null; then
+            sh /tmp/install-docker.sh 2>&1 | tee /tmp/docker_install.log || {
+                log_warn "Docker install script завершился с ошибкой, пробую альтернативный метод..."
+                apt-get install -y docker.io docker-compose 2>/dev/null || true
+            }
+            rm -f /tmp/install-docker.sh
+        else
+            log_warn "Не удалось скачать Docker install script, пробую apt..."
+            apt-get update -qq --allow-releaseinfo-change 2>/dev/null || true
+            apt-get install -y docker.io docker-compose 2>/dev/null || true
+        fi
+        
+        # Проверяем результат
+        if command -v docker &> /dev/null; then
+            systemctl enable --now docker 2>/dev/null || true
+            log_success "Docker установлен"
+        else
+            log_error "Не удалось установить Docker"
+            log_warn "Попробуйте установить вручную: curl -fsSL https://get.docker.com | sh"
+            return 1
+        fi
     else
         log_success "Docker уже установлен"
     fi
+    
+    # Docker Compose plugin
     if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
         log_info "Установка docker compose plugin..."
-        apt-get update && apt-get install -y docker-compose-plugin 2>/dev/null || true
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y docker-compose-plugin 2>/dev/null || apt-get install -y docker-compose 2>/dev/null || true
     fi
+    
     mark_installed "docker"
 }
 
@@ -261,7 +330,7 @@ services:
     network_mode: host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./beszel_agent_data:/var/lib/beszel-agent
+      - ./beszel_agent_/var/lib/beszel-agent
     environment:
       LISTEN: 45876
       KEY: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEYYsnCnXR6dh5nNdLY1ijqgWP6JzrbbFYcRSJF2m0gQ'
@@ -278,7 +347,7 @@ EOF
 }
 
 # =============================================================================
-# 6. SSH HARDENING + SAFE KEY WAIT ✨ ИСПРАВЛЕННЫЙ ЭТАП ✨
+# 6. SSH HARDENING + SAFE KEY WAIT
 # =============================================================================
 configure_ssh() {
     if is_installed "ssh_hardening"; then
@@ -292,7 +361,6 @@ configure_ssh() {
     log_warn "⚠️  Не закрывайте это окно пока не добавите свой SSH ключ!"
     echo ""
     
-    # 1. Бэкап оригинального конфига
     if [[ ! -f "$SSH_CONFIG_BACKUP" ]]; then
         log_info "Создаю бэкап оригинального sshd_config..."
         cp "$SSH_CONFIG_FILE" "$SSH_CONFIG_BACKUP"
@@ -301,7 +369,6 @@ configure_ssh() {
         log_info "Бэкап уже существует: $SSH_CONFIG_BACKUP"
     fi
     
-    # 2. Создаём директорию .ssh и файл authorized_keys
     log_info "Готовлю директорию для SSH ключей..."
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
@@ -309,7 +376,6 @@ configure_ssh() {
     chmod 600 "$SSH_KEY_WATCH_PATH"
     log_success "Файл создан: $SSH_KEY_WATCH_PATH"
     
-    # 3. Показываем текущие ключи (если есть)
     echo ""
     log_info "Текущие ключи в authorized_keys:"
     if [[ -s "$SSH_KEY_WATCH_PATH" ]]; then
@@ -321,7 +387,6 @@ configure_ssh() {
     fi
     echo ""
     
-    # 4. Применяем конфигурацию БЕЗ перезапуска SSH
     log_info "Применяю безопасные настройки SSH (без перезапуска)..."
     cat > "$SSH_CONFIG_FILE" << 'EOF'
 # RemnaWave SSH Hardening Config
@@ -348,7 +413,6 @@ KbdInteractiveAuthentication no
 EOF
     log_success "Конфигурация sshd_config применена"
     
-    # 5. Валидация конфига
     log_info "Валидирую конфигурацию SSH..."
     if sshd -t 2>&1; then
         log_success "Конфигурация SSH валидна ✓"
@@ -359,7 +423,6 @@ EOF
         exit 1
     fi
     
-    # 6. 🔑 ЖДЁМ ДОБАВЛЕНИЯ КЛЮЧА (интерактивный этап)
     echo ""
     echo -e "${MAGENTA}╔════════════════════════════════════════════════════╗${NC}"
     echo -e "${MAGENTA}║${NC}  🔐 ДОБАВЬТЕ SSH КЛЮЧ ПЕРЕД ПЕРЕЗАПУСКОМ SSH  ${MAGENTA}║${NC}"
@@ -380,7 +443,6 @@ EOF
     log_info "После добавления ключа вернитесь в это окно и подтвердите."
     echo ""
     
-    # Проверяем, есть ли уже ключи
     INITIAL_KEY_COUNT=$(wc -l < "$SSH_KEY_WATCH_PATH" 2>/dev/null || echo "0")
     
     if [[ "$INITIAL_KEY_COUNT" -eq 0 ]]; then
@@ -389,7 +451,6 @@ EOF
         echo ""
     fi
     
-    # Цикл ожидания подтверждения
     while true; do
         echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         read -p "Вы добавили SSH ключ и можете войти по ключу? [y/N]: " -n 1 -r
@@ -397,7 +458,6 @@ EOF
         echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            # Проверяем, что ключи действительно есть
             CURRENT_KEY_COUNT=$(wc -l < "$SSH_KEY_WATCH_PATH" 2>/dev/null || echo "0")
             
             if [[ "$CURRENT_KEY_COUNT" -eq 0 ]]; then
@@ -415,7 +475,6 @@ EOF
                 log_warn "! Количество ключей не изменилось (но продолжаю по вашему подтверждению)"
             fi
             
-            # Финальное предупреждение
             echo ""
             log_warn "⚠️  ФИНАЛЬНОЕ ПОДТВЕРЖДЕНИЕ:"
             read -p "Вы уверены, что можете войти по SSH ключу? После рестарта пароль не сработает! [y/N]: " -n 1 -r
@@ -442,7 +501,6 @@ EOF
         fi
     done
     
-    # 7. Перезапуск SSH (только после подтверждения!)
     echo ""
     log_info "Перезапускаю SSH сервис..."
     if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
@@ -452,7 +510,6 @@ EOF
         systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
     fi
     
-    # 8. Проверяем, что SSH работает
     sleep 2
     if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
         log_success "✓ SSH работает корректно"
@@ -464,7 +521,6 @@ EOF
         exit 1
     fi
     
-    # 9. 🔑 Настраиваем watcher для будущих ключей
     log_info "Настраиваю watcher для автоматического рестарта при добавлении ключей..."
     
     cat > /etc/systemd/system/ssh-key-watcher.service << 'EOF'
@@ -499,7 +555,6 @@ EOF
     
     log_success "Watcher настроен: SSH будет перезапущен при изменении $SSH_KEY_WATCH_PATH"
     
-    # 10. Маркируем как установленное
     mark_installed "ssh_hardening"
     
     echo ""
@@ -576,7 +631,7 @@ reset_installation() {
 # =============================================================================
 main() {
     echo -e "${GREEN}╔════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║${NC}  RemnaWave Node Installer v2.2 (Safe SSH)     ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  RemnaWave Node Installer v2.3 (Fix apt repos)${GREEN}║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
     echo ""
     
@@ -599,12 +654,12 @@ main() {
     show_status
     
     echo "Этапы (установленные будут пропущены):"
-    echo "  1. Docker"
+    echo "  1. Docker (с обработкой broken repos)"
     echo "  2. RemnaWave node"
     echo "  3. ZeroTier"
     echo "  4. Prometheus + node_exporter"
     echo "  5. Beszel monitoring agent"
-    echo "  6. 🔐 SSH Hardening (Safe Key Wait) ← ИСПРАВЛЕН"
+    echo "  6. 🔐 SSH Hardening (Safe Key Wait)"
     echo "  7. iptables firewall"
     echo ""
     
